@@ -108,6 +108,13 @@ inline std::string to_string(HashType hash_type) {
 	}
 }
 
+// Forward declarations;
+template <typename T>
+class GridEncoding;
+template <typename T, uint32_t N_POS_DIMS=3, uint32_t N_FEATURES_PER_LEVEL=2, HashType HASH_TYPE=HashType::CoherentPrime>
+class GridEncodingTemplated;
+
+
 template <uint32_t N_DIMS, uint32_t N_PRIMES>
 __device__ uint32_t lcg_hash(const uint32_t pos_grid[N_DIMS], const uint32_t primes[N_PRIMES]) {
 	static_assert(N_DIMS <= N_PRIMES, "lcg_hash can only hash up to N_PRIMES dimensions.");
@@ -221,7 +228,6 @@ template <typename T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, HashTy
 __global__ void kernel_grid(
 	const uint32_t num_elements,
 	const uint32_t num_grid_features,
-	const GridOffsetTable offset_table,
 	const uint32_t base_resolution,
 	const float log2_per_level_scale,
 	const float quantize_threshold,
@@ -232,7 +238,8 @@ __global__ void kernel_grid(
 	const T* __restrict__ grid,
 	MatrixView<const float> positions_in,
 	T* __restrict__ encoded_positions,
-	float* __restrict__ dy_dx
+	float* __restrict__ dy_dx,
+	GridEncodingTemplated<T, N_POS_DIMS, N_FEATURES_PER_LEVEL, HASH_TYPE> grid_object
 ) {
 	const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= num_elements) return;
@@ -264,8 +271,8 @@ __global__ void kernel_grid(
 		return;
 	}
 
-	grid += offset_table.data[level] * N_FEATURES_PER_LEVEL;
-	const uint32_t hashmap_size = offset_table.data[level + 1] - offset_table.data[level];
+	grid += grid_object.level_params_offset_impl(level) * N_FEATURES_PER_LEVEL;
+	const uint32_t hashmap_size = grid_object.level_n_params_impl(level);
 
 	const float scale = grid_scale(level, log2_per_level_scale, base_resolution);
 	const uint32_t resolution = grid_resolution(scale);
@@ -939,7 +946,7 @@ protected:
 	float m_quantize_threshold = 0.f;
 };
 
-template <typename T, uint32_t N_POS_DIMS=3, uint32_t N_FEATURES_PER_LEVEL=2, HashType HASH_TYPE=HashType::CoherentPrime>
+template <typename T, uint32_t N_POS_DIMS, uint32_t N_FEATURES_PER_LEVEL, HashType HASH_TYPE>
 class GridEncodingTemplated : public GridEncoding<T> {
 public:
 #if TCNN_MIN_GPU_ARCH >= 62 || TCNN_MIN_GPU_ARCH == 60
@@ -1071,7 +1078,6 @@ public:
 		kernel_grid<T, N_POS_DIMS, N_FEATURES_PER_LEVEL, HASH_TYPE><<<blocks_hashgrid, N_THREADS_HASHGRID, 0, synced_streams.get(0)>>>(
 			num_elements,
 			m_n_features,
-			m_offset_table,
 			m_base_resolution,
 			std::log2(m_per_level_scale),
 			this->m_quantize_threshold,
@@ -1082,7 +1088,8 @@ public:
 			use_inference_params ? m_grid_inference : m_grid,
 			forward->positions.data() ? forward->positions.view() : input.view(),
 			encoded_positions_soa,
-			forward->dy_dx.data()
+			forward->dy_dx.data(),
+			*this
 		);
 
 		if (output && output->layout() == AoS) {
@@ -1365,17 +1372,27 @@ public:
 		return m_n_params;
 	}
 
-	size_t level_n_params(uint32_t level) const override {
-		return level_params_offset(level + 1) - level_params_offset(level);
+  	size_t level_params_offset(uint32_t level) const {
+	  return level_params_offset_impl(level);
 	}
 
-	size_t level_params_offset(uint32_t level) const override {
+        __host__ __device__ size_t level_params_offset_impl(uint32_t level) const {
+#ifndef __CUDA_ARCH__
 		if (level >= m_offset_table.size) {
 			throw std::runtime_error{"Out of bounds params offset request."};
 		}
+#endif
 
 		return m_offset_table.data[level];
 	}
+
+  	size_t level_n_params(uint32_t level) const override {
+	  return level_n_params_impl(level);
+	}
+
+        __host__ __device__ size_t level_n_params_impl(uint32_t level) const {
+	  return level_params_offset_impl(level + 1) - level_params_offset_impl(level);
+        }
 
 	std::vector<std::pair<uint32_t, uint32_t>> layer_sizes() const override {
 		// Even though we have parameters, they can't really be considered a "layer".
